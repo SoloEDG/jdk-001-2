@@ -58,6 +58,30 @@ const tools: { id: ToolType; label: string; hint: string }[] = [
       </div>
     </section>
 
+    <section class="panel">
+      <h3>历史</h3>
+      <div class="history-actions">
+        <button
+          type="button"
+          class="action"
+          :disabled="!store.canUndo"
+          title="撤销 (Ctrl+Z)"
+          @click="store.undo"
+        >
+          撤销
+        </button>
+        <button
+          type="button"
+          class="action"
+          :disabled="!store.canRedo"
+          title="重做 (Ctrl+Shift+Z / Ctrl+Y)"
+          @click="store.redo"
+        >
+          重做
+        </button>
+      </div>
+    </section>
+
     <PalettePanel />
 
     <section class="panel export-panel">

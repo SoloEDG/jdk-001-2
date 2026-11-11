@@ -124,6 +124,17 @@ body {
   color: var(--accent);
 }
 
+.history-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.history-actions .action {
+  flex: 1;
+  width: auto;
+  margin-top: 0;
+}
+
 .swatches {
   display: grid;
   grid-template-columns: repeat(8, 1fr);

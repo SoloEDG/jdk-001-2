@@ -1,5 +1,5 @@
 import { computed, reactive, ref, watch } from 'vue'
-import { CANVAS_SIZES } from '../core/constants'
+import { CANVAS_SIZES, MAX_HISTORY_STEPS } from '../core/constants'
 import { exportAllFramesPng, exportFramePng } from '../core/exportPng'
 import { addCustomColor, pushRecentColor } from '../core/paletteService'
 import { compositeLayers } from '../core/pixelGrid'
@@ -26,6 +26,18 @@ import {
   withFrameLayers,
 } from './projectCommands'
 import { applyToolAt, cancelLineTool, type LinePending } from './toolController'
+import {
+  createFrameAddEntry,
+  createFrameDeleteEntry,
+  createHistory,
+  createLayerAddEntry,
+  createLayerDeleteEntry,
+  createPixelEditEntry,
+  createResizeEntry,
+  diffLayerPixels,
+  selectionOf,
+  type HistoryEntry,
+} from './history'
 
 const projects = ref<PixelProject[]>(ensureDefaultProject(loadProjects()))
 const prefs = reactive(loadPreferences())
@@ -35,6 +47,10 @@ const isPlaying = ref(false)
 const previewFrameIndex = ref<number | null>(null)
 
 const player = createAnimationPlayer({ isPlaying, previewFrameIndex })
+
+const history = createHistory(MAX_HISTORY_STEPS)
+const canUndo = computed(() => history.canUndo.value)
+const canRedo = computed(() => history.canRedo.value)
 
 function persistProjects() {
   saveProjects(projects.value)
@@ -70,6 +86,18 @@ function mutateProject(mutator: (p: PixelProject) => PixelProject) {
   persistProjects()
 }
 
+function applyProject(updated: PixelProject) {
+  projects.value = upsertProject(projects.value, { ...updated, updatedAt: Date.now() })
+  persistProjects()
+}
+
+function recordHistory(entry: HistoryEntry) {
+  const current = activeProject.value
+  if (!current) return
+  history.ensureProject(current.id)
+  history.record(entry)
+}
+
 const canvasSize = computed(() => activeProject.value?.canvasSize ?? 16)
 
 const activeFrame = computed(() => {
@@ -90,6 +118,7 @@ watch(
   () => {
     linePending.value = null
     player.stop()
+    history.clear()
   },
 )
 
@@ -114,7 +143,29 @@ function setTool(tool: ToolType) {
 
 function setCanvasSize(size: CanvasSize) {
   if (!CANVAS_SIZES.includes(size)) return
-  mutateProject((p) => withCanvasSize(p, size))
+  const current = activeProject.value
+  if (!current || current.canvasSize === size) return
+
+  const before = selectionOf(current)
+  const updated = withCanvasSize(current, size)
+  mutateProject(() => updated)
+  recordHistory(
+    createResizeEntry({
+      beforeSize: current.canvasSize,
+      beforeFrames: current.frames,
+      afterSize: updated.canvasSize,
+      afterFrames: updated.frames,
+      before,
+      after: selectionOf(updated),
+    }),
+  )
+}
+
+const TOOL_LABELS: Partial<Record<ToolType, string>> = {
+  brush: '画笔',
+  eraser: '橡皮',
+  bucket: '油漆桶',
+  line: '直线',
 }
 
 function onCanvasPointer(x: number, y: number) {
@@ -122,10 +173,11 @@ function onCanvasPointer(x: number, y: number) {
   const frame = activeFrame.value
   if (!p || !frame || previewFrameIndex.value !== null) return
 
+  const previousLayers = frame.layers
   const result = applyToolAt(
     {
       size: p.canvasSize,
-      layers: frame.layers,
+      layers: previousLayers,
       activeLayerIndex: p.activeLayerIndex,
       activeColor: prefs.activeColor,
       tool: prefs.activeTool,
@@ -139,10 +191,25 @@ function onCanvasPointer(x: number, y: number) {
   linePending.value = result.linePending
   if (result.activeColor) setActiveColor(result.activeColor)
 
-  if (result.layers !== frame.layers) {
-    mutateProject((proj) =>
-      withFrameLayers(proj, proj.activeFrameIndex, result.layers),
-    )
+  if (result.layers !== previousLayers) {
+    const updated = withFrameLayers(p, p.activeFrameIndex, result.layers)
+    mutateProject(() => updated)
+
+    // 只有前两个值真正变化的格子才进历史；同色重绘不产生空记录。
+    const patches = diffLayerPixels(previousLayers, result.layers)
+    if (patches.length > 0) {
+      const selection = selectionOf(p)
+      recordHistory(
+        createPixelEditEntry(
+          frame.id,
+          patches,
+          selection,
+          selection,
+          TOOL_LABELS[prefs.activeTool] ?? '绘制',
+        ),
+      )
+    }
+
     if (prefs.activeTool === 'brush' || prefs.activeTool === 'bucket' || prefs.activeTool === 'line') {
       recordColorUse(prefs.activeColor)
     }
@@ -158,11 +225,50 @@ function toggleLayerVisible(index: number) {
 }
 
 function deleteLayer(index: number) {
-  mutateProject((p) => deleteLayerAt(p, index))
+  const current = activeProject.value
+  const frame = current?.frames[current.activeFrameIndex]
+  const layer = frame?.layers[index]
+  if (!current || !frame || !layer || frame.layers.length <= 1) return
+
+  const updated = deleteLayerAt(current, index)
+  if (updated === current) return
+
+  const before = selectionOf(current)
+  mutateProject(() => updated)
+  recordHistory(
+    createLayerDeleteEntry({
+      frameId: frame.id,
+      layer,
+      index,
+      before,
+      after: selectionOf(updated),
+    }),
+  )
 }
 
 function addLayer() {
-  mutateProject((p) => addLayerToActiveFrame(p) ?? p)
+  const current = activeProject.value
+  const frame = current?.frames[current.activeFrameIndex]
+  if (!current || !frame) return
+
+  const updated = addLayerToActiveFrame(current)
+  if (!updated) return
+
+  const layers = updated.frames[updated.activeFrameIndex]?.layers ?? []
+  const layer = layers[layers.length - 1]
+  if (!layer) return
+
+  const before = selectionOf(current)
+  mutateProject(() => updated)
+  recordHistory(
+    createLayerAddEntry({
+      frameId: frame.id,
+      layer,
+      index: frame.layers.length,
+      before,
+      after: selectionOf(updated),
+    }),
+  )
 }
 
 function setActiveFrame(index: number) {
@@ -172,16 +278,67 @@ function setActiveFrame(index: number) {
 }
 
 function addFrame() {
-  mutateProject((p) => addFrameToProject(p) ?? p)
+  const current = activeProject.value
+  if (!current) return
+
+  const updated = addFrameToProject(current)
+  if (!updated) return
+
+  const index = current.frames.length
+  const frame = updated.frames[index]
+  if (!frame) return
+
+  const before = selectionOf(current)
+  mutateProject(() => updated)
+  recordHistory(
+    createFrameAddEntry({ frame, index, before, after: selectionOf(updated) }),
+  )
 }
 
 function deleteFrame(index: number) {
-  mutateProject((p) => deleteFrameAt(p, index))
+  const current = activeProject.value
+  const frame = current?.frames[index]
+  if (!current || !frame || current.frames.length <= 1) return
+
+  const updated = deleteFrameAt(current, index)
+  if (updated === current) return
+
+  const before = selectionOf(current)
+  mutateProject(() => updated)
+  recordHistory(
+    createFrameDeleteEntry({ frame, index, before, after: selectionOf(updated) }),
+  )
 }
 
 function setFrameDelay(ms: number) {
   const clamped = Math.max(50, Math.min(5000, Math.round(ms)))
   mutateProject((p) => ({ ...p, frameDelayMs: clamped }))
+}
+
+function prepareForHistoryJump() {
+  linePending.value = null
+  previewFrameIndex.value = null
+  player.stop()
+}
+
+function undo() {
+  const current = activeProject.value
+  if (!current) return
+  history.ensureProject(current.id)
+  const updated = history.undo(current)
+  if (!updated) return
+  prepareForHistoryJump()
+  applyProject(updated)
+}
+
+function redo() {
+  const current = activeProject.value
+  if (!current) return
+  history.ensureProject(current.id)
+  const updated = history.redo(current)
+  if (!updated) return
+  prepareForHistoryJump()
+  applyProject(updated)
 }
 
 function togglePlayback() {
@@ -212,6 +369,7 @@ function createNewProject(name?: string) {
   persistPrefs()
   linePending.value = null
   player.stop()
+  history.clear()
 }
 
 function loadProject(id: string) {
@@ -219,6 +377,7 @@ function loadProject(id: string) {
   persistPrefs()
   linePending.value = null
   player.stop()
+  history.clear()
 }
 
 function deleteProject(id: string) {
@@ -233,6 +392,7 @@ function deleteProject(id: string) {
   persistProjects()
   persistPrefs()
   player.stop()
+  history.clear()
 }
 
 function addCustomPaletteColor(color: string) {
@@ -269,10 +429,14 @@ function buildEditorStore() {
     linePending,
     isPlaying,
     previewFrameIndex,
+    canUndo,
+    canRedo,
     setActiveColor,
     setTool,
     setCanvasSize,
     onCanvasPointer,
+    undo,
+    redo,
     setActiveLayer,
     toggleLayerVisible,
     deleteLayer,

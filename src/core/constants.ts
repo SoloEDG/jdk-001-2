@@ -5,6 +5,7 @@ export const CANVAS_SIZES: CanvasSize[] = [16, 32, 64]
 export const MAX_LAYERS = 3
 export const MAX_FRAMES = 8
 export const MAX_RECENT_COLORS = 8
+export const MAX_HISTORY_STEPS = 50
 
 export const PRESET_COLORS: string[] = [
   '#000000',
